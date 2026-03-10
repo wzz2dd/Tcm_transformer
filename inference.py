@@ -4,6 +4,16 @@ import pandas as pd
 import numpy as np
 import os
 import glob
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from matplotlib.patches import Ellipse
+import seaborn as sns
+from sklearn.preprocessing import MinMaxScaler
+import os
+
+# 全局设置中文字体（解决图中中文和负号显示问题）
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Songti SC', 'STHeiti', 'Arial Unicode MS', 'WenQuanYi Micro Hei', 'sans-serif']
+plt.rcParams['axes.unicode_minus'] = False
 from scipy import stats  # 确保安装了 scipy: pip install scipy
 
 # ==========================================
@@ -12,12 +22,12 @@ from scipy import stats  # 确保安装了 scipy: pip install scipy
 # 这样可以确保推理用的模型结构与训练时完全一致
 from src.model import HerbTransformerGenerator
 from src.config import CONFIG as TRAIN_CONFIG 
-
+from src.visualize import generate_validation_plots
 # ==========================================
 # 2. 诊断与推理函数 (逻辑已更新)
 # ==========================================
 
-def batch_inference_debug(model_path, disease_folder, herb_matrix_file, mapping_file, output_file="final_results_cn.csv"):
+def batch_inference_debug(model_path, disease_folder, herb_matrix_file, mapping_file, output_file="final_results_qczs.csv"):
     INFERENCE_CONFIG = {
         'd_model': 256,       
         'nhead': 4,           
@@ -133,8 +143,8 @@ def batch_inference_debug(model_path, disease_folder, herb_matrix_file, mapping_
                 current_input = torch.zeros(1, 1, INFERENCE_CONFIG['d_model']).to(INFERENCE_CONFIG['device'])
                 logits_mask = torch.zeros(1, num_herbs).to(INFERENCE_CONFIG['device'])
                 
-                patient_formula_ids = []  # 存：HERB_A+HERB_B(0.9)
-                all_chinese_names_flat = [] # 扁平化列表，用于存拆分后的所有中文名
+                # [修改点1] 改为字典或结构体列表，方便后续按剂量排序
+                generated_herbs_info = [] 
                 
                 total_effect = torch.zeros_like(disease_vec) 
                 
@@ -145,29 +155,56 @@ def batch_inference_debug(model_path, disease_folder, herb_matrix_file, mapping_
                     dosage = dosage_pred.item()
                     
                     if dosage > 0.1:
-                        # 1. 获取原始组合ID (例如 "HERB_1020+HERB_1332")
                         raw_id_str = herb_names[chosen_idx.item()]
-                        
-                        # 2. 存入第4列用的列表 (保留原始结构和剂量)
-                        patient_formula_ids.append(f"{raw_id_str}({dosage:.2f})")
-                        
-                        # 3. [核心修改] 拆分 + 查表 + 存入第5列列表
-                        # 无论有没有 '+', split都能正常工作
-                        parts = raw_id_str.split('+') 
-                        
-                        for part in parts:
-                            clean_part = part.strip()
-                            # 查表，找不到就返回ID本身
-                            c_name = id_to_name.get(clean_part, clean_part)
-                            all_chinese_names_flat.append(c_name)
+                        # 暂时先记录下来，不急着分配君臣佐使
+                        generated_herbs_info.append({
+                            'raw_id': raw_id_str,
+                            'dosage': dosage,
+                            'step': t  # 记录生成顺序
+                        })
                         
                         one_hot = F.one_hot(chosen_idx, num_classes=num_herbs).float()
+                        # 依然使用精准的 dosage 进行药效叠加计算，保证准确率！
                         total_effect += torch.matmul(one_hot, herb_nes_tensor) * dosage
 
                     logits_mask.scatter_(1, chosen_idx.unsqueeze(1), 1.0)
                     next_embed = model.herb_embedding(chosen_idx) + model.dosage_projector(dosage_pred)
                     current_input = torch.cat([current_input, next_embed.unsqueeze(1)], dim=1)
             
+            # --- [核心修改：动态分配 君臣佐使] ---
+            patient_formula_ids = []  
+            all_chinese_names_flat = [] 
+            
+            if len(generated_herbs_info) > 0:
+                # 按照预测剂量从大到小进行排序
+                sorted_herbs = sorted(generated_herbs_info, key=lambda x: x['dosage'], reverse=True)
+                
+                num_total = len(sorted_herbs)
+                # 简单的前后比例分配规则（可根据你的中医理论微调）
+                # 前20%是君，接下来30%是臣，接着30%是佐，最后20%是使
+                for rank, herb_info in enumerate(sorted_herbs):
+                    ratio = rank / num_total
+                    if ratio < 0.2:
+                        role = "君"
+                    elif ratio < 0.5:
+                        role = "臣"
+                    elif ratio < 0.8:
+                        role = "佐"
+                    else:
+                        role = "使"
+                        
+                    raw_id = herb_info['raw_id']
+                    dos = herb_info['dosage']
+                    
+                    # 第4列：保留具体数值和君臣佐使标签
+                    patient_formula_ids.append(f"{raw_id}({dos:.2f}_{role})")
+                    
+                    # 第5列：拆分并映射中文名，加上君臣佐使
+                    parts = raw_id.split('+') 
+                    for part in parts:
+                        clean_part = part.strip()
+                        c_name = id_to_name.get(clean_part, clean_part)
+                        all_chinese_names_flat.append(f"{c_name}({role})")
             # 计算相关性
             vec_disease = disease_vec.squeeze().cpu().numpy()
             vec_formula = total_effect.squeeze().cpu().numpy()
@@ -175,7 +212,22 @@ def batch_inference_debug(model_path, disease_folder, herb_matrix_file, mapping_
             corr = float('nan')
             if mask.sum() >= 2:
                 corr, _ = stats.spearmanr(vec_formula[mask], vec_disease[mask])
-            
+            # 绘图
+            if not np.isnan(corr):
+                # 1. 提取生成药物的连续重要性分数(剂量)列表
+                # 注意：这里我们提取 generated_herbs_info 里记录的 dosage
+                dosages_list = [info['dosage'] for info in generated_herbs_info]
+                
+                # 2. 将 PyTorch Tensor 的中药矩阵转换为 Numpy，方便画图代码处理
+                herb_matrix_np = herb_nes_tensor.cpu().numpy()
+                
+                # 3. 调用画图模块，加入蒙特卡洛小提琴图所需的参数
+                generate_validation_plots(
+                    vec_disease, vec_formula, corr, file_name, 
+                    result_folder="validation_results",
+                    herb_matrix=herb_matrix_np,
+                    dosages=dosages_list
+                )
             # --- [去重逻辑] ---
             # 使用 dict.fromkeys 保留 "all_chinese_names_flat" 出现的顺序 (即按照剂量由高到低的顺序)
             unique_chinese_names = list(dict.fromkeys(all_chinese_names_flat))
